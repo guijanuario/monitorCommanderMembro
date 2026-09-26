@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Central de Comandos - Membro BR143
 // @namespace    central-comandos-membro-br143
-// @version      1.3.1
+// @version      1.4.1
 // @description  Lê, exporta e sincroniza automaticamente os comandos recebidos da própria conta no mundo BR143.
 // @updateURL    https://raw.githubusercontent.com/guijanuario/monitorCommanderMembro/main/userscripts/central-comandos-membro-br143.user.js
 // @downloadURL  https://raw.githubusercontent.com/guijanuario/monitorCommanderMembro/main/userscripts/central-comandos-membro-br143.user.js
@@ -9,6 +9,8 @@
 // @match        *://br143.guerrastribais.*/game.php*
 // @match        *://br143.tribalwars.com.br/game.php*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        unsafeWindow
 // @connect      monitorcommander.guitw2025.workers.dev
 // @run-at       document-end
@@ -19,9 +21,9 @@
   'use strict';
 
   const WORLD = 'br143';
-  // Estes dois valores precisam ser iguais aos do servidor. Troque a URL quando publicar em HTTPS.
+  // A versão pública não inclui a credencial; ela é configurada uma vez no menu do script.
   const SERVER_URL = 'https://monitorcommander.guitw2025.workers.dev';
-  const MEMBER_TOKEN = '8def18f7e186d5139d1ae7e549b4d8305e07af32d0a75555d7b64b34759971f7';
+  const MEMBER_TOKEN = '';
   const MAX_PAGES = 50;
   const TABLE_SELECTOR = '#incomings_table';
   const SYNC_INTERVAL = 5 * 60 * 1000;
@@ -72,6 +74,20 @@
     return 'unknown';
   }
 
+  function commandKind(first, image, label) {
+    const source = (image?.getAttribute('src') || '').toLowerCase();
+    const description = [cellText(label), image?.getAttribute('alt'), image?.getAttribute('title')].join(' ');
+    if (/\/support\.(?:png|webp)(?:\?|$)/.test(source) || /\b(?:apoio|support)\b/i.test(description)) return 'support';
+    if (/\/attack(?:_small|_medium|_large)?\.(?:png|webp)(?:\?|$)/.test(source) || /\b(?:ataque|attack|nobre|noble)\b/i.test(description)) return 'attack';
+    return 'unknown';
+  }
+
+  function hasNoble(first, label) {
+    if (first.querySelector('img[src*="/unit/tiny/snob"], img[src*="/unit/snob"], img[src*="/unit/tiny/noble"], img[src*="/unit/noble"]')) return true;
+    const description = [cellText(label), ...[...first.querySelectorAll('img')].map(img => `${img.alt || ''} ${img.title || ''}`)].join(' ');
+    return /\b(?:nobre|noble|snob)\b/i.test(description);
+  }
+
   function towerInfo(row, cells, headers) {
     const towerIndex = headers.findIndex(text => /torre\s*de\s*vigia|watchtower/i.test(text));
     const cell = towerIndex >= 0 ? cells[towerIndex] : null;
@@ -92,7 +108,7 @@
 
   function readPage(doc, player) {
     const table = doc.querySelector(TABLE_SELECTOR);
-    if (!table) throw new Error('A tabela de ataques recebidos não foi encontrada.');
+    if (!table) throw new Error('A tabela de comandos recebidos não foi encontrada.');
     const rows = [...table.querySelectorAll('tbody tr')];
     const headers = [...table.querySelectorAll('thead th, tr:first-child th')].map(cellText);
     return rows.flatMap(row => {
@@ -101,12 +117,15 @@
       const first = cells[0];
       const image = first.querySelector('img[src*="/graphic/command/"]');
       const label = first.querySelector('.quickedit-label, .quickedit span');
+      const kind = commandKind(first, image, label);
       const tower = towerInfo(row, cells, headers);
       return [{
         world: WORLD,
         player,
         command_id: commandId(row, first),
         type: cellText(label) || image?.alt || cellText(first),
+        command_kind: kind,
+        is_noble: kind === 'attack' && hasNoble(first, label),
         target: cellText(cells[1]),
         origin: cellText(cells[2]),
         attacker: cellText(cells[3]),
@@ -115,7 +134,7 @@
         arrival_at: arrivalTime(cells[5]),
         countdown: cellText(cells[6]),
         icon_src: image?.src || '',
-        axe_color: axeColor(image),
+        axe_color: kind === 'support' ? 'unknown' : axeColor(image),
         ...tower,
         captured_at: Date.now()
       }];
@@ -189,8 +208,18 @@
   }
 
   let syncing = false;
+  function configuredToken() {
+    const stored = GM_getValue('br143-member-token', null);
+    return String(stored === null ? MEMBER_TOKEN : stored).trim();
+  }
   async function sync() {
     if (syncing) return;
+    const token = configuredToken();
+    if (!token) {
+      const button = document.getElementById('br143-member-sync');
+      if (button) button.textContent = 'Configure o envio primeiro';
+      return;
+    }
     syncing = true;
     const button = document.getElementById('br143-member-sync');
     try {
@@ -199,7 +228,7 @@
       let sent = 0;
       for (let index = 0; index < result.commands.length; index += 200) {
         const batch = result.commands.slice(index, index + 200);
-        const response = await post(SERVER_URL, MEMBER_TOKEN, { world: WORLD, player: result.player, attacks: batch });
+        const response = await post(SERVER_URL, token, { world: WORLD, player: result.player, attacks: batch });
         sent += Number(response.accepted || 0);
       }
       if (button) button.textContent = `${sent} enviados`;
@@ -215,7 +244,7 @@
   }
 
   function csv(payload) {
-    const fields = ['world', 'player', 'command_id', 'type', 'target', 'origin', 'attacker',
+    const fields = ['world', 'player', 'command_id', 'type', 'command_kind', 'is_noble', 'target', 'origin', 'attacker',
       'distance', 'arrival_text', 'arrival_at', 'countdown', 'axe_color', 'watchtower',
       'watchtower_text', 'watchtower_at', 'watchtower_countdown', 'captured_at'];
     const escape = value => {
@@ -229,13 +258,24 @@
   function showButton() {
     if (document.getElementById('br143-member-export')) return;
     const box = document.createElement('div');
-    box.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:10000;display:flex;gap:5px;flex-wrap:wrap;max-width:440px';
+    box.style.cssText = 'position:fixed;top:98px;left:75px;z-index:10000;font:13px Arial,sans-serif';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.textContent = '↻';
+    toggle.title = 'Central BR143 · abrir opções de sincronização';
+    toggle.setAttribute('aria-label', 'Abrir opções da Central BR143');
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.style.cssText = 'display:grid;place-items:center;width:28px;height:28px;padding:0;background:#f3e1b5;color:#6b421d;border:1px solid #a77d43;border-radius:6px;box-shadow:0 1px 3px #0004;cursor:pointer;font-size:19px;line-height:1';
+    const menu = document.createElement('div');
+    menu.hidden = true;
+    menu.style.cssText = 'position:absolute;top:34px;left:0;width:210px;padding:9px;background:#f4e2bb;border:1px solid #a77d43;border-radius:7px;box-shadow:0 4px 15px #0006;display:none;flex-direction:column;gap:6px';
+    const heading = document.createElement('strong'); heading.textContent = 'Central BR143'; heading.style.cssText = 'color:#573416';
     const button = document.createElement('button');
     button.id = 'br143-member-export';
     button.type = 'button';
     button.textContent = 'Exportar recebidos BR143';
     button.title = 'Lê as páginas de ataques recebidos da sua conta e baixa um arquivo.';
-    const style = 'padding:10px;background:#286090;color:#fff;border:1px solid #173c63;border-radius:5px;cursor:pointer;box-shadow:0 2px 8px #0005';
+    const style = 'padding:7px 9px;background:#744a24;color:#fff;border:1px solid #573416;border-radius:4px;cursor:pointer;text-align:left';
     button.style.cssText = style;
     button.addEventListener('click', async () => {
       if (button.disabled) return;
@@ -260,9 +300,27 @@
     const syncButton = document.createElement('button');
     syncButton.id = 'br143-member-sync'; syncButton.type = 'button'; syncButton.textContent = 'Sincronizar BR143'; syncButton.style.cssText = style;
     syncButton.addEventListener('click', () => sync().catch(error => alert(`Falha na sincronização: ${error.message}`)));
-    box.append(button, syncButton);
+    const configButton = document.createElement('button');
+    configButton.type = 'button'; configButton.textContent = 'Configurar credencial de envio'; configButton.style.cssText = style;
+    configButton.addEventListener('click', () => {
+      const value = prompt('Digite a credencial de envio fornecida pela liderança (64 caracteres). Deixe vazio para desativar o envio neste navegador:');
+      if (value === null) return;
+      const token = value.trim();
+      if (token && !/^[a-f0-9]{64}$/i.test(token)) { alert('Credencial inválida. Verifique os 64 caracteres recebidos da liderança.'); return; }
+      GM_setValue('br143-member-token', token);
+      syncButton.textContent = token ? 'Sincronizar BR143' : 'Configure o envio primeiro';
+      toggle.title = token ? 'Central BR143 · envio configurado' : 'Central BR143 · configure o envio';
+      if (token) sync().catch(error => alert(`Falha na sincronização: ${error.message}`));
+    });
+    menu.append(heading, configButton, syncButton, button);
+    box.append(toggle, menu);
+    const setOpen = open => { menu.hidden = !open; menu.style.display = open ? 'flex' : 'none'; toggle.setAttribute('aria-expanded', String(open)); };
+    toggle.addEventListener('click', () => setOpen(menu.hidden));
+    document.addEventListener('click', event => { if (!box.contains(event.target)) setOpen(false); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') setOpen(false); });
     document.body.appendChild(box);
-    sync().catch(error => console.error('[Membro BR143]', error));
+    if (configuredToken()) sync().catch(error => console.error('[Membro BR143]', error));
+    else { syncButton.textContent = 'Configure o envio primeiro'; toggle.title = 'Central BR143 · configure o envio'; }
     setInterval(() => sync().catch(error => console.error('[Membro BR143]', error)), SYNC_INTERVAL);
   }
 
